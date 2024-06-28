@@ -54,19 +54,19 @@ ___TEMPLATE_PARAMETERS___
 
 ___SANDBOXED_JS_FOR_SERVER___
 
-// First, require the necessary server-side APIs.
 const getRequestBody = require('getRequestBody');
 const getRequestHeader = require('getRequestHeader');
 const getRequestMethod = require('getRequestMethod');
 const getRequestPath = require('getRequestPath');
 const getRequestQueryParameter = require('getRequestQueryParameter');
+const setResponseBody = require('setResponseBody');
+const setResponseHeader = require('setResponseHeader');
 const getRequestQueryParameters = require('getRequestQueryParameters');
 const getRequestQueryString = require('getRequestQueryString');
 const getRemoteAddress = require('getRemoteAddress');
 const decodeUriComponent = require('decodeUriComponent');
 const log = require('logToConsole');
 const Object = require('Object');
-const fromBase64 = require('fromBase64');
 const makeInteger = require('makeInteger');
 const getTimestampMillis = require('getTimestampMillis');
 const generateRandom = require('generateRandom');
@@ -79,25 +79,23 @@ const createRegex = require('createRegex');
 const setCookie = require('setCookie');
 const getCookieValues = require('getCookieValues');
 const computeEffectiveTldPlusOne = require('computeEffectiveTldPlusOne');
+const makeString = require('makeString');
 
 const requestMethod = getRequestMethod();
 const requestPath = getRequestPath();
-
-if (requestPath == '/taggrs') {
-  onRequestReceived();
-}
+let isEventModelsWrappedInArray = false;
 
 // call the function on receiving a request
-if(requestMethod === 'GET'){
+if(requestMethod === 'GET' || requestMethod === 'POST'){
   for (let key in data.path) {
     if (data.path[key].path === requestPath) {
         onRequestReceived();
     } else {
-      log('No permission, no additional paths added to the data client!');
+      log('No permission, request path is not added to the data client!');
     }
   }
 } else {
-  log('Unsupported request method ' + requestMethod + '. Supported methods: GET');
+  log('Unsupported request method ' + requestMethod + '. Supported methods: GET, POST');
 }
 
 /***
@@ -128,7 +126,10 @@ function onRequestReceived() {
       });
     })
   ).then((res) => {
-    log(res);
+    if (requestMethod === 'POST' || data.responseBodyGet) {
+      generateResponseBody(eventDataCollection);
+    }
+
     returnResponse();
   });
 }
@@ -143,36 +144,18 @@ function getEventDataWithQueryParams() {
   if (requestQueryParameters) {
     Object.keys(requestQueryParameters).forEach(function(queryParameterKey) {
       const value = requestQueryParameters[queryParameterKey];
+      let parsedValue = value;
 
-      if ((queryParameterKey === 'dtcd' || queryParameterKey === 'dtdc') && requestMethod === 'GET') {
-        const dt = queryParameterKey === 'dtcd' ? JSON.parse(value) : JSON.parse(fromBase64(value));
+      // Check if the value is a stringified array
+     if (isLikelyStringifiedArray(value)) {
+        parsedValue = JSON.parse(value);
+     }
 
-        for (let dtKey in dt) {
-          eventData[dtKey] = dt[dtKey];
-        }
-      } else {
-        // Remove surrounding quotes from the value, if any, and check if the value is a stringified array
-        let parsedValue = removeSurroundingQuotes(value);
-        if (isLikelyStringifiedArray(value)) {
-          parsedValue = JSON.parse(value);
-        }
-        eventData[queryParameterKey] = parsedValue;
-      }
+     eventData[queryParameterKey] = parsedValue;
     });
   }
 
   return eventData;
-}
-
-function removeSurroundingQuotes(str) {
-  if (typeof str !== 'string') return str;
-
-  while (str.length > 1 && ((str[0] === '"' && str[str.length - 1] === '"') || 
-                             (str[0] === "'" && str[str.length - 1] === "'"))) {
-    str = str.slice(1, str.length - 1);
-  }
-
-  return str;
 }
 
 /***
@@ -186,12 +169,8 @@ function isLikelyStringifiedArray(value) {
 *  Adds standard parameters to the eventData collection
 */
 function addStandardParamsToEventData(eventData) {
-  let userData = {};
-
-  if (eventData.user_data) userData = eventData.user_data;
-  
   if (!eventData.event_name) {
-    eventData.event_name = eventData.eventName || eventData.event || 'taggrs_event';
+    eventData.event_name = eventData.eventName || eventData.event || 'taggrs_webhook';
   }
 
   // check if ip_override parameter exists, if not
@@ -205,7 +184,6 @@ function addStandardParamsToEventData(eventData) {
       eventData.ip_override = getRemoteAddress();
   }
   
-  // add user_agent to eventData
   if (!eventData.user_agent) {
     if (eventData.userAgent) 
       eventData.user_agent = eventData.userAgent;
@@ -224,44 +202,12 @@ function addStandardParamsToEventData(eventData) {
     }
   }
   
-  // assign items to eventData
-  if (eventData.items && eventData.items[0]) {
-    var firstItem = eventData.items[0];
-
-    eventData.currency = eventData.currency || firstItem.currency;
-    eventData.item_id = eventData.item_id || firstItem.item_id;
-    eventData.item_name = eventData.item_name || firstItem.item_name;
-    eventData.item_brand = eventData.item_brand || firstItem.item_brand;
-    eventData.item_quantity = eventData.item_quantity || firstItem.quantity;
-    eventData.item_category = eventData.item_category || firstItem.item_category;
-
-    if (firstItem.price) {
-      eventData.item_price = eventData.item_price || firstItem.price;
-      eventData.value = eventData.value || (firstItem.quantity ? firstItem.quantity * firstItem.price : firstItem.price);
-    }
-
-    if (eventData.items.length > 1 && !eventData.value) {
-      var valueFromItems = 0;
-
-      eventData.items.forEach(function(item) {
-        valueFromItems += item.price * (item.quantity || 1);
-      });
-
-      if (valueFromItems) eventData.value = valueFromItems;
-    }
-  }
-  
   if(!eventData.page_referrer) {
     let str = getRequestHeader('Referer');
-
     if(str){
       let parts = str.split('?');
       eventData.page_referrer =  parts[0];
     }
-  }
-  
-  if (getObjectLength(userData) !== 0) {
-    eventData.user_data = userData;
   }
 
   return eventData;
@@ -281,27 +227,41 @@ function getEventDataCollection(baseEventModel) {
   const uniqueEventId = timestamp + '_' + generateRandom(100000000, 999999999);
 
   if (body) {
-    JSON.parse(body);
-    const bodyArray = getType(body) === 'array' && data.acceptMultipleEvents ? body : [body];
+    const contentType = getRequestHeader('content-type');
+    const isFormUrlEncoded = contentType && contentType.indexOf('application/x-www-form-urlencoded') >= 0;
+    let bodyJson;
 
-    // process the data object to be returned
-    return bodyArray.map((bodyItem) => {
-      let eventModel = {
-        timestamp: timestamp,
-        //unique_event_id: uniqueEventId,
-      };
-      for (let key in baseEventModel) {
-        eventModel[key] = baseEventModel[key];
+    if (isFormUrlEncoded) {
+      bodyJson = decodeParsedUrl(body);
+    } else {
+      bodyJson = JSON.parse(body);
+    }
+
+    if (bodyJson) {
+      const bodyType = getType(bodyJson);
+      if (!data.acceptMultipleEvents || bodyType !== 'array') {
+        bodyJson = [bodyJson];
+        isEventModelsWrappedInArray = true;
       }
-      for (let key in bodyItem) {
-        eventModel[key] = bodyItem[key];
-      }
-      return eventModel;
-    });
+
+      return bodyJson.map((bodyItem) => {
+        const eventModel = assign({}, baseEventModel, {
+          timestamp: timestamp,
+          unique_event_id: uniqueEventId,
+        });
+
+        for (let key in bodyItem) {
+          if (bodyItem.hasOwnProperty(key)) {
+            eventModel[key] = bodyItem[key];
+          }
+        }
+
+        return eventModel;
+      });
+    }
   }
-  
-  // if no body data is present:
 
+  // if no body data is present:
   const returnObject = {};
 
   for (const key in baseEventModel) {
@@ -309,7 +269,6 @@ function getEventDataCollection(baseEventModel) {
   }
 
   returnObject.timestamp = timestamp;
-  //returnObject.unique_event_id = uniqueEventId;
 
   return [returnObject];
 }
@@ -364,19 +323,112 @@ function getCookieType(eventModel) {
   return 'None';
 }
 
-function getObjectLength(object) {
-  let length = 0;
+/***
+*  Decodes an encoded URL (x-www-form-urlencoded)
+*/
+function decodeParsedUrl(data) {
+  const pairs = data.split('&');
+  const parsedData = {};
+  const regex = createRegex('\\+', 'g');
 
-  for (let key in object) {
-    if (object.hasOwnProperty(key)) {
-      ++length;
+  for (const pair of pairs) {
+    const pairValue = pair.split('=');
+    const key = pairValue[0];
+    const value = pairValue[1];
+    const keys = key
+      .split('.')
+      .map((k) => decodeUriComponent(k.replace(regex, ' ')));
+
+    let currentObject = parsedData;
+
+    for (let i = 0; i < keys.length - 1; i++) {
+      const currentKey = keys[i];
+
+      if (!currentObject[currentKey]) {
+        const nextKey = keys[i + 1];
+        const nextKeyIsNumber = makeString(makeInteger(nextKey)) === nextKey;
+        currentObject[currentKey] = nextKeyIsNumber ? [] : {};
+      }
+
+      currentObject = currentObject[currentKey];
+    }
+
+    const lastKey = keys[keys.length - 1];
+    const decodedValue = decodeUriComponent(value.replace(regex, ' '));
+    
+    log('Decoded value for key' + lastKey + ':' + decodedValue);
+    
+    let parsedValue; 
+    
+    if (isJSON(decodedValue)) {
+      parsedValue = JSON.parse(decodedValue);
+      log('Parsed value for key ' + lastKey + ': ' + parsedValue);
+    } else {
+      log('Using plain text value for key ' + lastKey + ': ' + decodedValue);
+      parsedValue = decodedValue;
+    }
+
+    if (getType(currentObject) === 'array') {
+      currentObject.push(parsedValue);
+    } else {
+      currentObject[lastKey] = parsedValue;
     }
   }
-  return length;
+
+  return parsedData;
 }
 
 /***
-*  Stores the client_is in Cookie storage
+*  Determine if value is a valid JSON object
+*/
+function isJSON(value) {
+  return (value.charAt(0) === '{' && value.charAt(value.length - 1) === '}') || 
+         (value.charAt(0) === '[' && value.charAt(value.length - 1) === ']');
+}
+
+/***
+*  Assigns values to target
+*/
+function assign() {
+  const target = arguments[0];
+  for (let i = 1; i < arguments.length; i++) {
+    for (let key in arguments[i]) {
+      target[key] = arguments[i][key];
+    }
+  }
+  return target;
+}
+
+/***
+*  Creates a response body
+*/
+function generateResponseBody(eventModels) {
+  if (data.responseBody === 'empty') {
+    return;
+  }
+
+  const responseModel = isEventModelsWrappedInArray ? eventModels[0] : eventModels;
+  setResponseHeader('Content-Type', 'application/json');
+
+  if (data.responseBody === 'eventData') {
+    setResponseBody(JSON.stringify(responseModel));
+    return;
+  }
+
+  const createResponseBody = (model) => ({
+    timestamp: model.timestamp,
+    unique_event_id: model.unique_event_id,
+  });
+
+  if (isEventModelsWrappedInArray) {
+    setResponseBody(JSON.stringify(createResponseBody(responseModel)));
+  } else {
+    setResponseBody(JSON.stringify(eventModels.map(createResponseBody)));
+  }
+}
+
+/***
+*  Stores the client_id in Cookie storage
 */
 function storeClientId(eventData) {
     setCookie('_dcid', eventData.client_id, {
@@ -550,6 +602,34 @@ ___SERVER_PERMISSIONS___
                 ]
               }
             ]
+          }
+        }
+      ]
+    },
+    "clientAnnotations": {
+      "isEditedByUser": true
+    },
+    "isRequired": true
+  },
+  {
+    "instance": {
+      "key": {
+        "publicId": "access_response",
+        "versionId": "1"
+      },
+      "param": [
+        {
+          "key": "writeResponseAccess",
+          "value": {
+            "type": 1,
+            "string": "any"
+          }
+        },
+        {
+          "key": "writeHeaderAccess",
+          "value": {
+            "type": 1,
+            "string": "specific"
           }
         }
       ]
